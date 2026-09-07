@@ -22,6 +22,16 @@ import org.eclipse.jetty.util.Callback;
  *
  * <p>GET requests pass through without buffering.
  *
+ * <p>The read is bounded. This handler sits in front of every connector and runs before any context, so it precedes
+ * authentication and every size check the filters make: {@code server.max-push-bytes} is enforced inside
+ * {@code ParseGitRequestFilter}, by which point the body is already in heap. Without a bound here that check reports
+ * the right error while allocating whatever was sent. The limit is applied twice — once against a declared
+ * {@code Content-Length}, and once as a running count, because git pushes use chunked encoding and declare no length.
+ *
+ * <p>This is a backstop, not the policy: it sits above {@code server.max-push-bytes} so that filter keeps answering the
+ * ordinary over-size push with an explanation, and this only intervenes on a body that would otherwise allocate without
+ * end.
+ *
  * @see <a href="docs/internals/GIT_INTERNALS.md">GIT_INTERNALS.md — "Large pushes and chunked transfer encoding"</a>
  */
 @Slf4j
@@ -40,6 +50,14 @@ public class BlockingContentHandler extends Handler.Wrapper {
             return super.handle(request, response, callback);
         }
 
+        // The proposals listeners buffer for themselves, bounded, in their gate filters. Pre-buffering here would
+        // read the body before authentication and hold up to this handler's limit for a caller who turns out not to
+        // be anyone. Nothing on those ports needs the chunked-encoding workaround either: this handler exists for
+        // reverse proxies that mangle a chunked git push, and a JSON request from a CLI declares its length.
+        if (isScmApiConnector(request)) {
+            return super.handle(request, response, callback);
+        }
+
         request.getContext().execute(() -> {
             try {
                 byte[] body = readAllContent(request);
@@ -55,6 +73,11 @@ public class BlockingContentHandler extends Handler.Wrapper {
             }
         });
         return true;
+    }
+
+    private static boolean isScmApiConnector(Request request) {
+        String name = request.getConnectionMetaData().getConnector().getName();
+        return name != null && name.startsWith(FogwallServletRegistrar.SCM_API_CONNECTOR_PREFIX);
     }
 
     private static byte[] readAllContent(Request request) throws Exception {
